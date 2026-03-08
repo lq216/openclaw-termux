@@ -9,10 +9,12 @@ import 'preferences_service.dart';
 
 class GatewayService {
   Timer? _healthTimer;
+  Timer? _initialDelayTimer;
   StreamSubscription? _logSubscription;
   final _stateController = StreamController<GatewayState>.broadcast();
   GatewayState _state = const GatewayState();
   DateTime? _startingAt;
+  bool _startInProgress = false;
   static final _tokenUrlRegex = RegExp(r'https?://(?:localhost|127\.0\.0\.1):18789/#token=[0-9a-f]+');
   static final _boxDrawing = RegExp(r'[│┤├┬┴┼╮╯╰╭─╌╴╶┌┐└┘◇◆]+');
 
@@ -69,6 +71,7 @@ class GatewayService {
       // Write allowCommands config so the next gateway restart picks it up,
       // and in case the running gateway supports config hot-reload.
       await _writeNodeAllowConfig();
+      _startingAt = DateTime.now();
       _updateState(_state.copyWith(
         status: GatewayStatus.starting,
         dashboardUrl: savedUrl,
@@ -176,6 +179,10 @@ fs.writeFileSync(p, JSON.stringify(c, null, 2));
   }
 
   Future<void> start() async {
+    // Prevent concurrent start() calls from racing
+    if (_startInProgress) return;
+    _startInProgress = true;
+
     final prefs = PreferencesService();
     await prefs.init();
     final savedUrl = prefs.dashboardUrl;
@@ -219,12 +226,15 @@ fs.writeFileSync(p, JSON.stringify(c, null, 2));
         errorMessage: 'Failed to start: $e',
         logs: [..._state.logs, _ts('[ERROR] Failed to start: $e')],
       ));
+    } finally {
+      _startInProgress = false;
     }
   }
 
   Future<void> stop() async {
-    _healthTimer?.cancel();
+    _cancelAllTimers();
     _logSubscription?.cancel();
+    _startingAt = null;
 
     try {
       await NativeBridge.stopGateway();
@@ -240,10 +250,20 @@ fs.writeFileSync(p, JSON.stringify(c, null, 2));
     }
   }
 
-  void _startHealthCheck() {
+  /// Cancel both the initial delay timer and periodic health timer.
+  void _cancelAllTimers() {
+    _initialDelayTimer?.cancel();
+    _initialDelayTimer = null;
     _healthTimer?.cancel();
-    // Delay the first health check by 15s — Node.js inside proot needs time to start
-    Future.delayed(const Duration(seconds: 15), () {
+    _healthTimer = null;
+  }
+
+  void _startHealthCheck() {
+    _cancelAllTimers();
+    // Delay the first health check by 30s — Node.js inside proot needs time to start.
+    // Use a Timer (not Future.delayed) so it can be cancelled on stop().
+    _initialDelayTimer = Timer(const Duration(seconds: 30), () {
+      _initialDelayTimer = null;
       if (_state.status == GatewayStatus.stopped) return;
       _checkHealth();
       _healthTimer = Timer.periodic(
@@ -270,10 +290,11 @@ fs.writeFileSync(p, JSON.stringify(c, null, 2));
       // Still starting or temporarily unreachable
       final isRunning = await NativeBridge.isGatewayRunning();
       if (!isRunning && _state.status != GatewayStatus.stopped) {
-        // Grace period: if we're still within 60s of startup, don't declare dead
+        // Grace period: if we're still within 120s of startup, don't declare dead.
+        // proot + Node.js can take a long time on first boot.
         if (_startingAt != null &&
             _state.status == GatewayStatus.starting &&
-            DateTime.now().difference(_startingAt!).inSeconds < 60) {
+            DateTime.now().difference(_startingAt!).inSeconds < 120) {
           _updateState(_state.copyWith(
             logs: [..._state.logs, _ts('[INFO] Starting, waiting for gateway...')],
           ));
@@ -283,7 +304,7 @@ fs.writeFileSync(p, JSON.stringify(c, null, 2));
           status: GatewayStatus.stopped,
           logs: [..._state.logs, _ts('[WARN] Gateway process not running')],
         ));
-        _healthTimer?.cancel();
+        _cancelAllTimers();
       }
     }
   }
@@ -300,7 +321,7 @@ fs.writeFileSync(p, JSON.stringify(c, null, 2));
   }
 
   void dispose() {
-    _healthTimer?.cancel();
+    _cancelAllTimers();
     _logSubscription?.cancel();
     _stateController.close();
   }
